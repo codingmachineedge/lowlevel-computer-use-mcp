@@ -23,6 +23,7 @@ dependencies = [
 
 [project.scripts]
 lowlevel-computer-use-mcp = "lowlevel_computer_use_mcp.server:main"
+lowlevel-computer-use-mcp-installer = "lowlevel_computer_use_mcp.installer_gui:main"
 
 [build-system]
 requires = ["hatchling"]

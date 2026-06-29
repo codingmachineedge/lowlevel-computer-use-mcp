@@ -537,3 +537,86 @@ def close_desktop(name: str) -> dict[str, Any]:
         return {"name": name, "closed": False, "note": "not tracked"}
     user32.CloseDesktop(hdesk)
     return {"name": name, "closed": True}
+
+
+# --------------------------------------------------------------------------- #
+# Temporary visibility: show a hidden window / switch to a headless desktop
+# (e.g. so a human can complete an interactive login), then hide again.
+# --------------------------------------------------------------------------- #
+SW_HIDE = 0
+SW_SHOWNORMAL = 1
+SW_SHOW = 5
+SW_MINIMIZE = 6
+SW_RESTORE = 9
+DESKTOP_SWITCHDESKTOP = 0x0100
+
+user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
+user32.SetForegroundWindow.argtypes = [HWND]
+user32.SetForegroundWindow.restype = wintypes.BOOL
+user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+user32.OpenInputDesktop.restype = HDESK
+user32.SwitchDesktop.argtypes = [HDESK]
+user32.SwitchDesktop.restype = wintypes.BOOL
+
+# Remembers the input desktop we left so hide_desktop can switch back.
+_saved_input_desktop: Optional[int] = None
+
+
+def show_window(hwnd: int) -> dict[str, Any]:
+    """Make a hidden/minimized window visible and bring it to the foreground.
+
+    Use this when an automated app on the *normal* desktop needs human interaction
+    (e.g. a login prompt). Pair with hide_window to put it away again afterwards.
+    """
+    if not user32.IsWindow(hwnd):
+        raise WinIOError(f"No window with handle {hwnd}.")
+    user32.ShowWindow(hwnd, SW_RESTORE)
+    user32.ShowWindow(hwnd, SW_SHOW)
+    user32.SetForegroundWindow(hwnd)
+    return {"hwnd": int(hwnd), "visible": True}
+
+
+def hide_window(hwnd: int, minimize: bool = False) -> dict[str, Any]:
+    """Hide a window again (SW_HIDE removes it from the taskbar; minimize just tucks it away)."""
+    if not user32.IsWindow(hwnd):
+        raise WinIOError(f"No window with handle {hwnd}.")
+    user32.ShowWindow(hwnd, SW_MINIMIZE if minimize else SW_HIDE)
+    return {"hwnd": int(hwnd), "visible": False, "minimized": minimize}
+
+
+def show_desktop(name: str) -> dict[str, Any]:
+    """Switch the live input desktop to a headless desktop so a human can use it.
+
+    The whole off-screen desktop becomes the interactive one (its app windows are
+    now on screen). Remember to call hide_desktop to return to the normal desktop -
+    typically after the user finishes an interactive login.
+    """
+    global _saved_input_desktop
+    hdesk = _DESKTOPS.get(name)
+    if hdesk is None:
+        hdesk = user32.OpenDesktopW(name, 0, False, GENERIC_ALL)
+        _check(hdesk, f"OpenDesktopW('{name}')")
+        _DESKTOPS[name] = int(hdesk)
+    current = user32.OpenInputDesktop(0, False, GENERIC_ALL)
+    _saved_input_desktop = int(current) if current else None
+    _check(user32.SwitchDesktop(hdesk), f"SwitchDesktop('{name}')")
+    return {
+        "name": name,
+        "visible": True,
+        "note": "This desktop is now interactive. Call hide_headless_desktop to switch back.",
+    }
+
+
+def hide_desktop(name: Optional[str] = None) -> dict[str, Any]:
+    """Switch the input desktop back to the one we came from (or 'Default')."""
+    global _saved_input_desktop
+    target = _saved_input_desktop
+    if target is None:
+        target = user32.OpenDesktopW("Default", 0, False, GENERIC_ALL)
+        _check(target, "OpenDesktopW('Default')")
+    _check(user32.SwitchDesktop(target), "SwitchDesktop(restore)")
+    if _saved_input_desktop is not None:
+        user32.CloseDesktop(_saved_input_desktop)
+        _saved_input_desktop = None
+    return {"restored": True}

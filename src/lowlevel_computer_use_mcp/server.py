@@ -84,11 +84,46 @@ try:
 except Exception:  # pragma: no cover
     winio = None
 
+# AutoHotkey add-in (cross-platform import; tools require AHK installed on Windows)
+try:
+    from . import ahk as ahk_addon
+except Exception:  # pragma: no cover
+    ahk_addon = None
+
 
 # --------------------------------------------------------------------------- #
 # Server + constants
 # --------------------------------------------------------------------------- #
-mcp = FastMCP("computer_use_mcp")
+SERVER_INSTRUCTIONS = """\
+Low-level computer-use server: mouse, keyboard, shell, windows, processes,
+screenshots, cropping, screen recording, run-as-admin and boot-startup.
+
+BACKGROUND / UNFOCUSED CONTROL is first-class. mouse_click, type_text and
+screenshot all accept `hwnd` or `window_title`. When set, input is delivered to
+that exact window via Win32 messages WITHOUT focusing or foregrounding it, and
+screenshot uses PrintWindow so the window is captured even if occluded, minimized,
+or running on an off-screen headless desktop. Workflow:
+  1. list_windows to find the top-level window (title + handle).
+  2. list_child_windows to find the specific control (e.g. the Edit box) + its rect.
+  3. Drive it: mouse_click(hwnd=..., x, y) with CLIENT coords, type_text(hwnd=...),
+     win_set_control_text(hwnd=...) (most reliable for text), win_send_keys(hwnd=...).
+  4. screenshot(hwnd=...) to see the result without bringing the window forward.
+Headless GUI: create_headless_desktop -> launch_on_headless_desktop ->
+list_headless_windows -> drive + screenshot(hwnd=...) -> close_headless_desktop.
+
+MACROS AS SKILLS: when you perform a multi-step UI sequence that the user is
+likely to repeat (e.g. "open app X, click here, type this, save"), DO NOT leave it
+as ad-hoc tool calls. Capture it as a reusable macro by creating a Skill that
+records the ordered tool calls with their parameters, so it can be replayed later.
+Use the skill-creator skill (or write a SKILL.md) following the template in this
+repo's macros/MACRO_SKILL_TEMPLATE.md. A good macro skill: names the goal, lists
+the exact tool calls in order (with concrete hwnd/title resolution steps, not
+hard-coded handles, since handles change per launch), notes verification
+screenshots, and parameterizes the parts that vary (text to type, file to open).
+Prefer background-targeting tools in macros so replays don't steal focus.
+"""
+
+mcp = FastMCP("computer_use_mcp", instructions=SERVER_INSTRUCTIONS)
 
 CAPTURE_DIR = Path(
     os.environ.get(
@@ -1672,6 +1707,244 @@ async def close_headless_desktop(params: HeadlessDesktopInput) -> str:
     try:
         return _ok(**winio.close_desktop(params.name))
     except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+# =========================================================================== #
+# TEMPORARY VISIBILITY (show for login, then hide again)
+# =========================================================================== #
+@mcp.tool(
+    name="show_window",
+    annotations={
+        "title": "Show Window (Foreground)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def show_window(params: WinTargetInput) -> str:
+    """Make a hidden/minimized window visible and bring it to the foreground.
+
+    Useful when an automated app on the normal desktop hits a step that needs the
+    human - typically an interactive LOGIN. Show it, let the user sign in, then call
+    `hide_window` to tuck it away and resume background automation.
+
+    Args:
+        params (WinTargetInput): the window by hwnd or title.
+
+    Returns:
+        str: JSON {"ok": true, "hwnd": N, "visible": true}.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        top = winio.find_top_window(params.window_title, params.hwnd)
+        return _ok(**winio.show_window(top))
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+class HideWindowInput(WinTargetInput):
+    minimize: bool = Field(
+        default=False,
+        description="Minimize instead of fully hiding (SW_HIDE removes it from the taskbar)",
+    )
+
+
+@mcp.tool(
+    name="hide_window",
+    annotations={
+        "title": "Hide Window",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def hide_window(params: HideWindowInput) -> str:
+    """Hide a window again after it was shown (e.g. once login is complete).
+
+    Args:
+        params (HideWindowInput): the window by hwnd or title, and a minimize flag.
+
+    Returns:
+        str: JSON {"ok": true, "hwnd": N, "visible": false}.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        top = winio.find_top_window(params.window_title, params.hwnd)
+        return _ok(**winio.hide_window(top, minimize=params.minimize))
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+@mcp.tool(
+    name="show_headless_desktop",
+    annotations={
+        "title": "Show Headless Desktop (Interactive)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def show_headless_desktop(params: HeadlessDesktopInput) -> str:
+    """Temporarily switch the live screen to a headless desktop for human interaction.
+
+    The entire off-screen desktop (and the apps running on it) becomes interactive
+    and visible, so a person can complete a LOGIN or any manual step. Call
+    `hide_headless_desktop` to switch back to the normal desktop afterwards.
+
+    Args:
+        params (HeadlessDesktopInput): the off-screen desktop name.
+
+    Returns:
+        str: JSON {"ok": true, "name": "...", "visible": true, "note": "..."}.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        return _ok(**winio.show_desktop(params.name))
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+@mcp.tool(
+    name="hide_headless_desktop",
+    annotations={
+        "title": "Hide Headless Desktop",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def hide_headless_desktop(params: HeadlessDesktopInput) -> str:
+    """Switch the live screen back to the normal desktop after show_headless_desktop.
+
+    Args:
+        params (HeadlessDesktopInput): the off-screen desktop name (for symmetry).
+
+    Returns:
+        str: JSON {"ok": true, "restored": true}.
+    """
+    if (e := _require(winio, "winio (Windows)")):
+        return e
+    try:
+        return _ok(**winio.hide_desktop(params.name))
+    except winio.WinIOError as exc:
+        return _err(str(exc))
+
+
+# =========================================================================== #
+# AUTOHOTKEY ADD-IN
+# =========================================================================== #
+@mcp.tool(
+    name="ahk_status",
+    annotations={
+        "title": "AutoHotkey Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def ahk_status() -> str:
+    """Report whether AutoHotkey is installed and where.
+
+    Returns:
+        str: JSON {"ok": true, "installed": bool, "path": "...", "version": "v2", ...}.
+    """
+    if (e := _require(ahk_addon, "ahk")):
+        return e
+    return _ok(**ahk_addon.status())
+
+
+class RunAhkInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str = Field(..., description="AutoHotkey script source to run", min_length=1)
+    args: Optional[list[str]] = Field(default=None, description="Command-line args passed to the script")
+    timeout: float = Field(default=60.0, description="Max seconds before the script is killed", ge=1, le=3600)
+    exe_path: Optional[str] = Field(default=None, description="Override path to the AutoHotkey interpreter")
+
+
+@mcp.tool(
+    name="run_ahk",
+    annotations={
+        "title": "Run AutoHotkey Script",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def run_ahk(params: RunAhkInput) -> str:
+    """Run an inline AutoHotkey script and capture its output.
+
+    The script MUST terminate (call ExitApp, or be non-persistent) or it runs until
+    the timeout. Emit output with FileAppend to the target "*" (stdout). AHK is ideal
+    for reliable background input (ControlSend/ControlClick) and real hotkeys.
+
+    Args:
+        params (RunAhkInput): script source, optional args, timeout, optional exe path.
+
+    Returns:
+        str: JSON {"ok": bool, "returncode": int, "stdout": "...", "stderr": "...", "exe": "..."}.
+    """
+    if (e := _require(ahk_addon, "ahk")):
+        return e
+    try:
+        return _ok(**ahk_addon.run_script(params.code, args=params.args, timeout=params.timeout, exe_path=params.exe_path))
+    except ahk_addon.AhkError as exc:
+        return _err(str(exc))
+
+
+class AhkControlSendInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    text: str = Field(..., description="Text to send (or AHK key syntax if as_keys=true, e.g. '^a{Del}')")
+    window: str = Field(
+        ...,
+        description="AHK window target: 'ahk_id <HWND>', 'ahk_exe notepad.exe', or a window title",
+    )
+    control: str = Field(default="", description="AHK control target (e.g. 'ahk_id <controlHWND>' or ClassNN); blank = focused control")
+    as_keys: bool = Field(default=False, description="Interpret text as AHK key sequence instead of literal text")
+    timeout: float = Field(default=30.0, description="Max seconds", ge=1, le=600)
+
+
+@mcp.tool(
+    name="ahk_control_send",
+    annotations={
+        "title": "AHK ControlSend (Background Input)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def ahk_control_send(params: AhkControlSendInput) -> str:
+    """Send text or keystrokes to a background window/control via AutoHotkey ControlSend.
+
+    Works without focusing the window and is often more reliable than raw WM_CHAR for
+    complex apps. Target a HWND with 'ahk_id <handle>'.
+
+    Args:
+        params (AhkControlSendInput): text, window/control targets, as_keys, timeout.
+
+    Returns:
+        str: JSON with the AHK run result.
+    """
+    if (e := _require(ahk_addon, "ahk")):
+        return e
+    try:
+        return _ok(
+            **ahk_addon.control_send(
+                params.text, params.window, control=params.control,
+                as_keys=params.as_keys, timeout=params.timeout,
+            )
+        )
+    except ahk_addon.AhkError as exc:
         return _err(str(exc))
 
 

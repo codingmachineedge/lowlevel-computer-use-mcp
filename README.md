@@ -1,21 +1,27 @@
 # lowlevel-computer-use-mcp
 
-A **low-level computer-use MCP server** for Windows (works on macOS/Linux for most
-tools too). It exposes raw desktop control to any MCP client — Claude Code, Codex,
-Claude Desktop, etc. — as a set of well-described tools:
+A **low-level computer-use MCP server** for Windows (most tools also work on
+macOS/Linux). It exposes raw desktop control to any MCP client — Claude Code,
+Codex, Claude Desktop, etc. — as a set of well-described tools:
 
 - 🖱️ **Mouse** — move, click, double/right/middle click, drag, scroll, cursor position
 - ⌨️ **Keyboard** — type text, press hotkey combinations (Ctrl+C, Alt+Tab, …)
-- 🖥️ **Shell commands** — run arbitrary system commands and capture stdout/stderr/exit code
-- 🪟 **Windows** — list, move, resize, focus, minimize, maximize, restore, close
+- 🖥️ **Shell commands** — run arbitrary system commands and capture output
+- 🪟 **Windows** — list, move, resize, focus, minimize, maximize, restore, close, **show/hide**
 - ⚙️ **Processes** — list running processes; kill by PID or name
-- 📸 **Screenshots** — capture all monitors, one monitor, or a pixel region (PNG)
+- 📸 **Screenshots** — all monitors, one monitor, a region, or **one window via PrintWindow**
 - ✂️ **Cropping** — crop any saved image to a sub-region
-- 🎥 **Screen recording** — record a monitor or region to an mp4 in the background
+- 🎥 **Screen recording** — record a monitor or region to mp4 in the background
+- 🎯 **Background / unfocused targeting** — drive a specific window via Win32 messages **without focusing it**
+- 🫥 **Headless GUI** — run real GUI apps on an off-screen desktop; show them only when a human login is needed
+- 🛡️ **Run-as-admin** — per-command UAC elevation or whole-server elevation
+- 🚀 **Auto-start on boot** — register a logon scheduled task (optionally as admin)
+- 🟢 **AutoHotkey add-in** — run AHK scripts; `ControlSend`/`ControlClick` for rock-solid background input
+- 🧩 **GUI installer** — one window that installs everything automatically
 
 > ⚠️ **This server performs real, unsandboxed actions on the host machine** —
-> clicking, typing, killing processes and running shell commands with your user's
-> privileges. Only register it in environments where that is acceptable.
+> clicking, typing, killing processes and running shell/elevated commands with your
+> user's privileges. Only register it in environments where that is acceptable.
 
 ---
 
@@ -26,62 +32,89 @@ Claude Desktop, etc. — as a set of well-described tools:
 | `get_screen_size` | Primary screen resolution |
 | `get_cursor_position` | Current mouse position |
 | `mouse_move` | Move cursor to `(x, y)` |
-| `mouse_click` | Click (left/right/middle), with click count for double-clicks |
+| `mouse_click` | Click; **`hwnd`/`window_title` → background click (client coords)** |
 | `mouse_drag` | Press-drag-release between two points |
 | `mouse_scroll` | Scroll the wheel up/down |
-| `type_text` | Type a string at the current focus |
+| `type_text` | Type text; **`hwnd`/`window_title` → background WM_CHAR** |
 | `press_keys` | Press a key / hotkey combo, e.g. `["ctrl","c"]` |
-| `run_command` | Run a shell command, capture output, exit code, timeout |
+| `run_command` | Run a shell command, capture output/exit code |
 | `list_windows` | List top-level windows (title, handle, geometry, state) |
 | `get_active_window` | Info about the focused window |
-| `move_window` | Move a window (by handle or title) |
-| `resize_window` | Resize a window |
-| `window_action` | `focus` / `minimize` / `maximize` / `restore` / `close` |
-| `list_processes` | List processes (pid, name, memory, cpu), sortable |
-| `kill_process` | Kill by PID, or all by exact name; graceful or forced |
-| `screenshot` | Capture a monitor or region to PNG |
+| `move_window` / `resize_window` | Move / resize a window |
+| `window_action` | focus / minimize / maximize / restore / close |
+| `show_window` / `hide_window` | Bring a window forward (e.g. for login), then hide it again |
+| `list_child_windows` | Enumerate a window's child controls (class, text, rect, handle) |
+| `win_set_control_text` | Set a control's text via WM_SETTEXT (reliable background text) |
+| `win_send_keys` | Post key presses to a window without focusing it |
+| `list_processes` / `kill_process` | List processes; kill by PID or name |
+| `screenshot` | Monitor/region/**single-window (PrintWindow)** capture to PNG |
 | `crop_image` | Crop an existing image to a box |
-| `start_screen_recording` | Start recording to mp4 (background thread) |
-| `stop_screen_recording` | Stop & finalize the mp4 |
-| `recording_status` | Whether a recording is active |
+| `start_screen_recording` / `stop_screen_recording` / `recording_status` | mp4 recording |
+| `create_headless_desktop` | Create an off-screen desktop |
+| `launch_on_headless_desktop` | Launch a GUI app onto it |
+| `list_headless_windows` | List windows on the off-screen desktop |
+| `show_headless_desktop` / `hide_headless_desktop` | Temporarily make it interactive (login), then hide |
+| `close_headless_desktop` | Release the off-screen desktop handle |
+| `ahk_status` | Whether AutoHotkey is installed |
+| `run_ahk` | Run an inline AutoHotkey script |
+| `ahk_control_send` | AHK ControlSend to a background window/control |
 | `is_admin` | Whether the server is running elevated |
 | `run_command_as_admin` | Run a shell command elevated (UAC prompt) |
-| `install_startup` | Auto-start the server at logon (optionally as admin) |
-| `uninstall_startup` | Remove the auto-start task |
-| `startup_status` | Whether auto-start is installed |
+| `install_startup` / `uninstall_startup` / `startup_status` | Boot auto-start |
 
-Every tool returns a JSON string of the form `{"ok": true, ...}` on success or
+Every tool returns a JSON string `{"ok": true, ...}` on success or
 `{"ok": false, "error": "..."}` on failure.
 
 ---
 
-## Requirements
+## Quick start (GUI installer — fully automatic)
 
-- **Python 3.10+**
-- **[uv](https://docs.astral.sh/uv/)** (recommended) — handles the virtualenv and
-  dependencies automatically. (Plain `pip` also works.)
-- Windows is the primary target. Window management uses `pygetwindow` (Windows-best);
-  mouse/keyboard via `pyautogui`; screenshots via `mss`; recording via
-  `imageio` + `imageio-ffmpeg` (bundled ffmpeg, no separate install).
+The easiest path. It installs `uv` if missing, runs `uv sync`, and registers the
+server with both Claude Code and Codex automatically on launch.
 
-## Install / run
-
-Clone and let `uv` resolve everything on first run:
+Clone the repo:
 
 ```bash
-git clone https://github.com/<your-org>/lowlevel-computer-use-mcp.git
-cd lowlevel-computer-use-mcp
-uv run lowlevel-computer-use-mcp     # starts the stdio MCP server
+git clone https://github.com/codingmachineedge/lowlevel-computer-use-mcp.git
 ```
 
-Or with pip:
+Enter it:
+
+```bash
+cd lowlevel-computer-use-mcp
+```
+
+Launch the installer (it auto-runs the full install):
+
+```bash
+uv run lowlevel-computer-use-mcp-installer
+```
+
+Then **restart Claude Code / Codex** so they spawn the server.
+
+---
+
+## Manual install
+
+Install dependencies and start the stdio server:
+
+```bash
+uv run lowlevel-computer-use-mcp
+```
+
+Or with pip — install in editable mode:
 
 ```bash
 pip install -e .
+```
+
+Then run it:
+
+```bash
 lowlevel-computer-use-mcp
 ```
 
-Captured screenshots and recordings are written to
+Captures (screenshots, recordings) are written to
 `~/lowlevel-computer-use-captures` by default. Override with the
 `LOWLEVEL_CU_CAPTURE_DIR` environment variable.
 
@@ -89,29 +122,24 @@ Captured screenshots and recordings are written to
 
 ## Registering with clients
 
-Replace the directory path below with wherever you cloned this repo.
+Replace the path below with wherever you cloned this repo.
 
 ### Claude Code
 
-Either run:
+Register at user scope (one line):
 
 ```bash
-claude mcp add lowlevel-computer-use -- uv run --directory "C:\path\to\lowlevel-computer-use-mcp" lowlevel-computer-use-mcp
+claude mcp add lowlevel-computer-use --scope user -- uv run --directory "C:\path\to\lowlevel-computer-use-mcp" lowlevel-computer-use-mcp
 ```
 
-…or add it to your `~/.claude.json` under `mcpServers`:
+Or add this to `~/.claude.json` under `mcpServers`:
 
 ```json
 {
   "mcpServers": {
     "lowlevel-computer-use": {
       "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "C:\\path\\to\\lowlevel-computer-use-mcp",
-        "lowlevel-computer-use-mcp"
-      ]
+      "args": ["run", "--directory", "C:\\path\\to\\lowlevel-computer-use-mcp", "lowlevel-computer-use-mcp"]
     }
   }
 }
@@ -119,98 +147,242 @@ claude mcp add lowlevel-computer-use -- uv run --directory "C:\path\to\lowlevel-
 
 ### Codex (OpenAI Codex CLI)
 
-Add to `~/.codex/config.toml`:
+Add this block to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.lowlevel-computer-use]
 command = "uv"
 args = ["run", "--directory", "C:\\path\\to\\lowlevel-computer-use-mcp", "lowlevel-computer-use-mcp"]
+startup_timeout_sec = 60
 ```
-
-Then restart the client. The tools appear namespaced under the server name.
 
 ---
 
-## Example calls
+## Background / unfocused window targeting
+
+`mouse_click`, `type_text` and `screenshot` accept `hwnd` or `window_title`. When
+set, input is delivered to that exact window via Win32 messages **without focusing
+or foregrounding it**, and `screenshot` uses `PrintWindow` so the window is captured
+even if it's behind others, minimized, or on an off-screen desktop.
+
+Typical flow:
+
+1. Find the window:
 
 ```jsonc
-// Take a screenshot of the primary monitor
-screenshot { "monitor": 1 }
-
-// Crop the top-left 400x300 of it
-crop_image { "input_path": "C:\\Users\\me\\lowlevel-computer-use-captures\\screenshot-...png",
-             "left": 0, "top": 0, "width": 400, "height": 300 }
-
-// Move the mouse and double-click
-mouse_click { "x": 960, "y": 540, "clicks": 2 }
-
-// Run a command
-run_command { "command": "ipconfig /all" }
-
-// Move a window by title
-move_window { "title": "Notepad", "x": 100, "y": 100 }
-
-// Kill a process by name (forced)
-kill_process { "name": "notepad.exe", "force": true }
-
-// Record the screen for a few seconds
-start_screen_recording { "fps": 15, "monitor": 1 }
-// ...later...
-stop_screen_recording {}
+list_windows { "title_filter": "Notepad" }
 ```
+
+2. Find the control to target:
+
+```jsonc
+list_child_windows { "window_title": "Notepad" }
+```
+
+3. Set its text in the background (most reliable for edit controls):
+
+```jsonc
+win_set_control_text { "hwnd": 23924320, "text": "typed without focus" }
+```
+
+4. Or click it in the background (x/y are **client** coords of the window):
+
+```jsonc
+mouse_click { "window_title": "Notepad", "x": 200, "y": 120 }
+```
+
+5. See the result without bringing it forward:
+
+```jsonc
+screenshot { "window_title": "Notepad" }
+```
+
+> Caveat: message-based input is ignored by some apps (raw input / DirectInput /
+> physical-key-state checks). For those, use the **AutoHotkey** `ahk_control_send`
+> tool, or bring the window forward briefly.
+
+---
+
+## Headless-but-with-GUI mode
+
+Run a real GUI app on an off-screen Win32 desktop so it never touches your visible
+desktop, then automate and screenshot it via the background tools.
+
+Create the off-screen desktop:
+
+```jsonc
+create_headless_desktop { "name": "work" }
+```
+
+Launch an app onto it:
+
+```jsonc
+launch_on_headless_desktop { "name": "work", "command": "notepad.exe" }
+```
+
+List its windows (to get handles):
+
+```jsonc
+list_headless_windows { "name": "work" }
+```
+
+Capture a window on it (works even though it's off-screen):
+
+```jsonc
+screenshot { "hwnd": 2495156 }
+```
+
+### Showing it for an interactive login, then hiding again
+
+Some steps (sign-in) need a human. Temporarily switch the live screen to the
+off-screen desktop:
+
+```jsonc
+show_headless_desktop { "name": "work" }
+```
+
+…let the user log in, then switch back to the normal desktop:
+
+```jsonc
+hide_headless_desktop { "name": "work" }
+```
+
+For an ordinary hidden window on the normal desktop, use `show_window` /
+`hide_window` instead:
+
+```jsonc
+show_window { "window_title": "My App" }
+```
+
+```jsonc
+hide_window { "window_title": "My App" }
+```
+
+---
+
+## AutoHotkey add-in
+
+Optional but powerful. AHK's `ControlSend`/`ControlClick` drive background windows
+very reliably, and `run_ahk` is a full scripting escape hatch.
+
+Install AutoHotkey (one line):
+
+```bash
+winget install -e --id AutoHotkey.AutoHotkey
+```
+
+Check the server can find it:
+
+```jsonc
+ahk_status {}
+```
+
+Send text to a background window by HWND:
+
+```jsonc
+ahk_control_send { "text": "hello", "window": "ahk_id 0x1A2B3C" }
+```
+
+Run an arbitrary AHK script (must call `ExitApp`):
+
+```jsonc
+run_ahk { "code": "ControlSendText \"hi\", , \"ahk_exe notepad.exe\"\nExitApp" }
+```
+
+Point the server at a specific AHK exe by setting `LOWLEVEL_CU_AHK` to its path.
+
+---
+
+## Macros — save repeated sequences as Skills
+
+When you run a multi-step UI sequence the user is likely to repeat, **don't leave
+it as ad-hoc tool calls — capture it as a reusable macro Skill.** The server tells
+agents to do this automatically; see
+[`macros/MACRO_SKILL_TEMPLATE.md`](macros/MACRO_SKILL_TEMPLATE.md) for the template
+and rules (resolve handles at run time, prefer background tools, parameterize the
+variable parts, verify with a screenshot).
 
 ---
 
 ## Run-as-admin mode
 
-Some actions (writing to `Program Files`, editing `HKLM`, managing services) need
-Administrator rights. There are two ways to get them:
+Per-command elevation — call `run_command_as_admin` (UAC prompt unless already
+elevated):
 
-1. **Per-command elevation** — call the `run_command_as_admin` tool. If the server
-   isn't already elevated, Windows shows a UAC prompt; once approved the command
-   runs with full admin rights and its output is captured and returned. Use
-   `is_admin` to check the current elevation state.
+```jsonc
+run_command_as_admin { "command": "net session" }
+```
 
-2. **Run the whole server elevated** — launch it with the `--admin` flag:
+Or run the whole server elevated (intended for HTTP mode):
 
-   ```bash
-   uv run lowlevel-computer-use-mcp --http --admin
-   ```
+```bash
+uv run lowlevel-computer-use-mcp --http --admin
+```
 
-   If not already elevated it relaunches itself through UAC. (Elevating spawns a
-   fresh console, so `--admin` is meant for `--http` mode — a stdio server must be
-   elevated by its parent client, e.g. by starting Claude Code/Codex as admin.)
+Check elevation:
+
+```jsonc
+is_admin {}
+```
+
+---
 
 ## Auto-start on boot
 
-Register a Windows Scheduled Task that launches the server automatically at logon —
-by default **with Administrator privileges** (RunLevel *Highest*) and in **HTTP
-mode** so it's always available after a reboot:
+Register a logon Scheduled Task (admin + HTTP by default):
 
 ```bash
-# from the repo (or call the install_startup tool from your MCP client)
-uv run lowlevel-computer-use-mcp install-startup                 # admin + HTTP on 127.0.0.1:8765
-uv run lowlevel-computer-use-mcp install-startup --no-admin      # normal privileges
-uv run lowlevel-computer-use-mcp install-startup --port 9000     # custom port
-uv run lowlevel-computer-use-mcp startup-status                  # check
-uv run lowlevel-computer-use-mcp uninstall-startup               # remove
+uv run lowlevel-computer-use-mcp install-startup
 ```
 
-The same operations are exposed as MCP tools: `install_startup`, `uninstall_startup`,
-`startup_status`. Registering an admin task requires elevation, so a UAC prompt
-appears if the server isn't already elevated. The task uses an **interactive logon**
-trigger (not SYSTEM) so the desktop-automation tools keep access to your session.
+Install without admin privileges:
 
-Once the boot service is running in HTTP mode, point a client at it as a remote MCP
-server, e.g. for Claude Code:
+```bash
+uv run lowlevel-computer-use-mcp install-startup --no-admin
+```
+
+Use a custom port:
+
+```bash
+uv run lowlevel-computer-use-mcp install-startup --port 9000
+```
+
+Check the task status:
+
+```bash
+uv run lowlevel-computer-use-mcp startup-status
+```
+
+Remove it:
+
+```bash
+uv run lowlevel-computer-use-mcp uninstall-startup
+```
+
+Once the boot service runs in HTTP mode, point a client at it as a remote MCP
+server:
 
 ```bash
 claude mcp add --transport http lowlevel-computer-use-boot http://127.0.0.1:8765/mcp
 ```
 
+The task uses an **interactive logon** trigger (not SYSTEM) so the
+desktop-automation tools keep access to your session.
+
+---
+
+## Requirements
+
+- **Python 3.10+**
+- **[uv](https://docs.astral.sh/uv/)** (recommended; the GUI installer can bootstrap it)
+- Windows is the primary target. Mouse/keyboard via `pyautogui`; windows via
+  `pygetwindow`; background input + capture + headless desktop via `ctypes`/Win32
+  (`winio.py`); screenshots via `mss`; recording via `imageio` + bundled ffmpeg.
+
 ## Safety notes
 
-- `run_command`, `kill_process` and `window_action(close)` are marked **destructive**.
+- `run_command`, `run_command_as_admin`, `kill_process`, `run_ahk` and
+  `window_action(close)` are marked **destructive**.
 - `pyautogui`'s fail-safe is disabled so automation isn't interrupted by the cursor
   reaching a screen corner; be deliberate with coordinates.
 - The server has no authentication of its own — it trusts the MCP client that spawns it.
