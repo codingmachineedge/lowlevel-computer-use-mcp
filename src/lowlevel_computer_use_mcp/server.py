@@ -19,10 +19,15 @@ it in a context where that is acceptable.
 
 from __future__ import annotations
 
+import argparse
+import ctypes
 import json
 import os
 import platform
+import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -109,6 +114,169 @@ def _require(module: Any, name: str) -> Optional[str]:
             f"Install it (e.g. `pip install {name}`) and restart the server."
         )
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Admin / elevation + boot-startup helpers (Windows)
+# --------------------------------------------------------------------------- #
+TASK_NAME = "LowLevelComputerUseMCP"
+DEFAULT_HTTP_HOST = os.environ.get("LOWLEVEL_CU_HOST", "127.0.0.1")
+DEFAULT_HTTP_PORT = int(os.environ.get("LOWLEVEL_CU_PORT", "8765"))
+
+
+def _repo_dir() -> Path:
+    """Path to the cloned repo root (parent of the src/ package)."""
+    return Path(__file__).resolve().parents[2]
+
+
+def _uv_path() -> str:
+    """Best-effort absolute path to the uv launcher used to run this server."""
+    found = shutil.which("uv")
+    if found:
+        return found
+    candidate = Path.home() / ".local" / "bin" / ("uv.exe" if os.name == "nt" else "uv")
+    return str(candidate) if candidate.exists() else "uv"
+
+
+def _is_admin() -> bool:
+    """Return True if the current process is running elevated (Windows admin)."""
+    if os.name != "nt":
+        try:
+            return os.geteuid() == 0  # type: ignore[attr-defined]
+        except AttributeError:
+            return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _server_launch_argument(http: bool, host: str, port: int) -> str:
+    """The argument string passed to uv to start this server (for a scheduled task)."""
+    parts = ["run", "--directory", str(_repo_dir()), "lowlevel-computer-use-mcp"]
+    if http:
+        parts += ["--http", "--host", host, "--port", str(port)]
+    return subprocess.list2cmdline(parts)
+
+
+def _clean_transcript(text: str) -> str:
+    """Strip PowerShell transcript header/footer noise, keeping the real output."""
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines) if l.startswith("Transcript started")), None)
+    end = next((i for i, l in enumerate(lines) if "transcript end" in l.lower()), len(lines))
+    body = lines[start + 1 : end] if start is not None else lines
+    body = [l for l in body if l.strip() and set(l.strip()) != {"*"}]
+    return "\n".join(body).strip()
+
+
+def _run_powershell(body: str, require_admin: bool, timeout: float = 180.0) -> dict[str, Any]:
+    """Run a PowerShell script.
+
+    If require_admin is True and the process is not elevated, the script is
+    relaunched through a UAC prompt (Start-Process -Verb RunAs) and its output is
+    captured via a transcript file. Returns {ok, returncode, output}.
+    """
+    if os.name != "nt":
+        return {"ok": False, "returncode": -1, "output": "Admin/startup features require Windows."}
+
+    if not require_admin or _is_admin():
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", body],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return {
+                "ok": proc.returncode == 0,
+                "returncode": proc.returncode,
+                "output": (proc.stdout + proc.stderr).strip(),
+            }
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "returncode": -1, "output": f"PowerShell timed out after {timeout}s"}
+
+    # Not elevated: relaunch the script through UAC, capturing output via transcript.
+    log_fd, log_path = tempfile.mkstemp(suffix=".log", prefix="llcu-")
+    os.close(log_fd)
+    ps1_fd, ps1_path = tempfile.mkstemp(suffix=".ps1", prefix="llcu-")
+    os.close(ps1_fd)
+    try:
+        wrapped = (
+            f"Start-Transcript -Path '{log_path}' -Force | Out-Null\n"
+            f"try {{\n{body}\n}} catch {{ Write-Output \"ERROR: $($_.Exception.Message)\" }}\n"
+            f"Stop-Transcript | Out-Null\n"
+        )
+        Path(ps1_path).write_text(wrapped, encoding="utf-8")
+        launcher = (
+            "$p = Start-Process powershell -ArgumentList "
+            f"@('-NoProfile','-ExecutionPolicy','Bypass','-File','{ps1_path}') "
+            "-Verb RunAs -Wait -WindowStyle Hidden -PassThru; exit $p.ExitCode"
+        )
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", launcher],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        output = ""
+        if Path(log_path).exists():
+            output = _clean_transcript(Path(log_path).read_text(encoding="utf-8", errors="replace"))
+        if proc.returncode != 0 and not output:
+            output = (proc.stderr or "Elevation was cancelled or failed.").strip()
+        return {"ok": proc.returncode == 0, "returncode": proc.returncode, "output": output}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "returncode": -1, "output": "Elevated PowerShell timed out (UAC prompt unanswered?)"}
+    finally:
+        for p in (log_path, ps1_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def _install_startup(http: bool, host: str, port: int, run_as_admin: bool) -> dict[str, Any]:
+    """Register a scheduled task that starts this server at user logon."""
+    uv = _uv_path()
+    arg = _server_launch_argument(http, host, port).replace("'", "''")
+    uv_q = uv.replace("'", "''")
+    repo_q = str(_repo_dir()).replace("'", "''")
+    run_level = "Highest" if run_as_admin else "Limited"
+    body = (
+        "$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name\n"
+        f"$action = New-ScheduledTaskAction -Execute '{uv_q}' -Argument '{arg}' -WorkingDirectory '{repo_q}'\n"
+        "$trigger = New-ScheduledTaskTrigger -AtLogOn\n"
+        f"$principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel {run_level}\n"
+        "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries "
+        "-ExecutionTimeLimit (New-TimeSpan -Seconds 0) -StartWhenAvailable\n"
+        f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Trigger $trigger "
+        "-Principal $principal -Settings $settings -Force | Out-Null\n"
+        f"Write-Output 'Installed scheduled task {TASK_NAME} (RunLevel={run_level}, AtLogon).'\n"
+    )
+    return _run_powershell(body, require_admin=True)
+
+
+def _uninstall_startup() -> dict[str, Any]:
+    """Remove the boot-startup scheduled task."""
+    body = (
+        f"if (Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue) {{\n"
+        f"  Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false\n"
+        f"  Write-Output 'Removed scheduled task {TASK_NAME}.'\n"
+        "} else { Write-Output 'Task was not installed.' }\n"
+    )
+    return _run_powershell(body, require_admin=True)
+
+
+def _startup_status() -> dict[str, Any]:
+    """Report whether the boot-startup scheduled task is installed."""
+    body = (
+        f"$t = Get-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue\n"
+        "if ($t) {\n"
+        "  $i = $t | Get-ScheduledTaskInfo\n"
+        "  $lvl = $t.Principal.RunLevel\n"
+        "  Write-Output \"INSTALLED|State=$($t.State)|RunLevel=$lvl|LastRun=$($i.LastRunTime)|NextRun=$($i.NextRunTime)\"\n"
+        "} else { Write-Output 'NOT_INSTALLED' }\n"
+    )
+    return _run_powershell(body, require_admin=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -1145,11 +1313,248 @@ async def recording_status() -> str:
 
 
 # =========================================================================== #
+# ADMIN / ELEVATION + BOOT STARTUP
+# =========================================================================== #
+@mcp.tool(
+    name="is_admin",
+    annotations={
+        "title": "Check Admin Privileges",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def is_admin() -> str:
+    """Report whether this server process is running elevated (as Administrator).
+
+    Returns:
+        str: JSON {"ok": true, "is_admin": bool, "platform": "Windows"}.
+    """
+    return _ok(is_admin=_is_admin(), platform=platform.system())
+
+
+class RunAsAdminInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    command: str = Field(..., description="Command line to execute with elevation (via cmd.exe)", min_length=1)
+    timeout: float = Field(default=120.0, description="Max seconds to wait", ge=1, le=3600)
+
+
+@mcp.tool(
+    name="run_command_as_admin",
+    annotations={
+        "title": "Run Command As Admin",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def run_command_as_admin(params: RunAsAdminInput) -> str:
+    """Run a shell command with Administrator privileges.
+
+    If the server is not already elevated this triggers a Windows UAC prompt that
+    the user must approve. Output is captured and returned. This runs commands
+    with full administrative rights - use with care.
+
+    Args:
+        params (RunAsAdminInput): the command line and a timeout.
+
+    Returns:
+        str: JSON {"ok": bool, "returncode": int, "output": "...", "elevated_prompt": bool}.
+    """
+    if os.name != "nt":
+        return _err("run_command_as_admin requires Windows.")
+    escaped = params.command.replace("'", "''")
+    body = f"& $env:ComSpec /c '{escaped}'\nexit $LASTEXITCODE"
+    needed_prompt = not _is_admin()
+    result = _run_powershell(body, require_admin=True, timeout=params.timeout)
+    return json.dumps(
+        {
+            "ok": result["ok"],
+            "returncode": result["returncode"],
+            "output": result["output"],
+            "elevated_prompt": needed_prompt,
+        },
+        indent=2,
+        default=str,
+    )
+
+
+class InstallStartupInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    run_as_admin: bool = Field(
+        default=True,
+        description="Register the task to run with highest (Administrator) privileges",
+    )
+    http: bool = Field(
+        default=True,
+        description="Start the server in HTTP mode at boot (recommended; a stdio server has no client to talk to at boot)",
+    )
+    host: str = Field(default=DEFAULT_HTTP_HOST, description="Host for HTTP mode")
+    port: int = Field(default=DEFAULT_HTTP_PORT, description="Port for HTTP mode", ge=1, le=65535)
+
+
+@mcp.tool(
+    name="install_startup",
+    annotations={
+        "title": "Install Boot Startup",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def install_startup(params: InstallStartupInput) -> str:
+    """Install a scheduled task so this server starts automatically at user logon.
+
+    By default the task runs with Administrator privileges (RunLevel Highest) and
+    launches the server in HTTP mode so it is always available after boot.
+    Registering the task requires elevation - a UAC prompt appears if the server
+    is not already elevated.
+
+    Args:
+        params (InstallStartupInput): run_as_admin, http, host and port options.
+
+    Returns:
+        str: JSON {"ok": bool, "output": "...", "task_name": "...", "run_as_admin": bool}.
+    """
+    if os.name != "nt":
+        return _err("install_startup requires Windows.")
+    result = _install_startup(params.http, params.host, params.port, params.run_as_admin)
+    return json.dumps(
+        {
+            "ok": result["ok"],
+            "task_name": TASK_NAME,
+            "run_as_admin": params.run_as_admin,
+            "mode": "http" if params.http else "stdio",
+            "endpoint": f"http://{params.host}:{params.port}/mcp" if params.http else None,
+            "output": result["output"],
+        },
+        indent=2,
+        default=str,
+    )
+
+
+@mcp.tool(
+    name="uninstall_startup",
+    annotations={
+        "title": "Uninstall Boot Startup",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def uninstall_startup() -> str:
+    """Remove the boot-startup scheduled task (requires elevation; may prompt UAC).
+
+    Returns:
+        str: JSON {"ok": bool, "output": "...", "task_name": "..."}.
+    """
+    if os.name != "nt":
+        return _err("uninstall_startup requires Windows.")
+    result = _uninstall_startup()
+    return json.dumps(
+        {"ok": result["ok"], "task_name": TASK_NAME, "output": result["output"]},
+        indent=2,
+        default=str,
+    )
+
+
+@mcp.tool(
+    name="startup_status",
+    annotations={
+        "title": "Boot Startup Status",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def startup_status() -> str:
+    """Report whether the boot-startup scheduled task is installed and its state.
+
+    Returns:
+        str: JSON {"ok": bool, "installed": bool, "details": "...", "task_name": "..."}.
+    """
+    if os.name != "nt":
+        return _err("startup_status requires Windows.")
+    result = _startup_status()
+    out = result["output"]
+    installed = out.startswith("INSTALLED")
+    return _ok(installed=installed, details=out, task_name=TASK_NAME)
+
+
+# =========================================================================== #
 # Entry point
 # =========================================================================== #
+def _serve(http: bool, host: str, port: int) -> None:
+    if http:
+        mcp.settings.host = host
+        mcp.settings.port = port
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
+
+
 def main() -> None:
-    """Run the MCP server over stdio."""
-    mcp.run()
+    """CLI entry point.
+
+    Default: run the MCP server over stdio (for Claude Code / Codex).
+    Subcommands manage the boot-startup scheduled task. Flags switch transport
+    and elevation.
+    """
+    parser = argparse.ArgumentParser(
+        prog="lowlevel-computer-use-mcp",
+        description="Low-level computer-use MCP server.",
+    )
+    parser.add_argument("--http", action="store_true", help="Serve over streamable HTTP instead of stdio")
+    parser.add_argument("--host", default=DEFAULT_HTTP_HOST, help="Host for --http mode")
+    parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT, help="Port for --http mode")
+    parser.add_argument(
+        "--admin",
+        action="store_true",
+        help="Relaunch the server elevated (UAC) if not already running as Administrator",
+    )
+
+    sub = parser.add_subparsers(dest="cmd")
+    p_install = sub.add_parser("install-startup", help="Register a logon scheduled task to auto-start the server")
+    p_install.add_argument("--no-admin", action="store_true", help="Do not run the task as Administrator")
+    p_install.add_argument("--stdio", action="store_true", help="Start in stdio mode instead of HTTP")
+    p_install.add_argument("--host", default=DEFAULT_HTTP_HOST)
+    p_install.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
+    sub.add_parser("uninstall-startup", help="Remove the auto-start scheduled task")
+    sub.add_parser("startup-status", help="Show the auto-start task status")
+
+    args = parser.parse_args()
+
+    if args.cmd == "install-startup":
+        res = _install_startup(
+            http=not args.stdio, host=args.host, port=args.port, run_as_admin=not args.no_admin
+        )
+        print(res["output"])
+        sys.exit(0 if res["ok"] else 1)
+    if args.cmd == "uninstall-startup":
+        res = _uninstall_startup()
+        print(res["output"])
+        sys.exit(0 if res["ok"] else 1)
+    if args.cmd == "startup-status":
+        res = _startup_status()
+        print(res["output"])
+        sys.exit(0 if res["ok"] else 1)
+
+    # Serve mode
+    if args.admin and os.name == "nt" and not _is_admin():
+        # Relaunch elevated. Note: an elevated process gets its own console, so this
+        # is intended for --http mode (a stdio server must be launched elevated by
+        # its parent client instead).
+        forwarded = [a for a in sys.argv[1:] if a != "--admin"]
+        params = subprocess.list2cmdline(["-m", "lowlevel_computer_use_mcp.server", *forwarded])
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        sys.exit(0)
+
+    _serve(http=args.http, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

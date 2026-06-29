@@ -44,6 +44,11 @@ Claude Desktop, etc. — as a set of well-described tools:
 | `start_screen_recording` | Start recording to mp4 (background thread) |
 | `stop_screen_recording` | Stop & finalize the mp4 |
 | `recording_status` | Whether a recording is active |
+| `is_admin` | Whether the server is running elevated |
+| `run_command_as_admin` | Run a shell command elevated (UAC prompt) |
+| `install_startup` | Auto-start the server at logon (optionally as admin) |
+| `uninstall_startup` | Remove the auto-start task |
+| `startup_status` | Whether auto-start is installed |
 
 Every tool returns a JSON string of the form `{"ok": true, ...}` on success or
 `{"ok": false, "error": "..."}` on failure.
@@ -155,6 +160,53 @@ stop_screen_recording {}
 ```
 
 ---
+
+## Run-as-admin mode
+
+Some actions (writing to `Program Files`, editing `HKLM`, managing services) need
+Administrator rights. There are two ways to get them:
+
+1. **Per-command elevation** — call the `run_command_as_admin` tool. If the server
+   isn't already elevated, Windows shows a UAC prompt; once approved the command
+   runs with full admin rights and its output is captured and returned. Use
+   `is_admin` to check the current elevation state.
+
+2. **Run the whole server elevated** — launch it with the `--admin` flag:
+
+   ```bash
+   uv run lowlevel-computer-use-mcp --http --admin
+   ```
+
+   If not already elevated it relaunches itself through UAC. (Elevating spawns a
+   fresh console, so `--admin` is meant for `--http` mode — a stdio server must be
+   elevated by its parent client, e.g. by starting Claude Code/Codex as admin.)
+
+## Auto-start on boot
+
+Register a Windows Scheduled Task that launches the server automatically at logon —
+by default **with Administrator privileges** (RunLevel *Highest*) and in **HTTP
+mode** so it's always available after a reboot:
+
+```bash
+# from the repo (or call the install_startup tool from your MCP client)
+uv run lowlevel-computer-use-mcp install-startup                 # admin + HTTP on 127.0.0.1:8765
+uv run lowlevel-computer-use-mcp install-startup --no-admin      # normal privileges
+uv run lowlevel-computer-use-mcp install-startup --port 9000     # custom port
+uv run lowlevel-computer-use-mcp startup-status                  # check
+uv run lowlevel-computer-use-mcp uninstall-startup               # remove
+```
+
+The same operations are exposed as MCP tools: `install_startup`, `uninstall_startup`,
+`startup_status`. Registering an admin task requires elevation, so a UAC prompt
+appears if the server isn't already elevated. The task uses an **interactive logon**
+trigger (not SYSTEM) so the desktop-automation tools keep access to your session.
+
+Once the boot service is running in HTTP mode, point a client at it as a remote MCP
+server, e.g. for Claude Code:
+
+```bash
+claude mcp add --transport http lowlevel-computer-use-boot http://127.0.0.1:8765/mcp
+```
 
 ## Safety notes
 
