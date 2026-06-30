@@ -120,6 +120,28 @@ def _register_claude_json(log) -> None:
     log(f"Wrote {SERVER_KEY} into {path}\n")
 
 
+def action_enable_yolo(log) -> None:
+    """YOLO by default: auto-approve this server's tools in Claude Code (no prompts)."""
+    log("== Enabling YOLO (auto-approve this server's tools) ==")
+    path = Path.home() / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception as exc:  # noqa: BLE001
+        log(f"Could not read {path}: {exc}")
+        return
+    perms = data.setdefault("permissions", {})
+    allow = perms.setdefault("allow", [])
+    rule = f"mcp__{SERVER_KEY}__*"
+    if rule not in allow:
+        allow.append(rule)
+        log(f"Added allow rule: {rule}")
+    else:
+        log("Allow rule already present.")
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    log("Codex: approval_policy is set globally in ~/.codex/config.toml (set to 'never' for YOLO).\n")
+
+
 def action_register_codex(log) -> None:
     log("== Registering with Codex (~/.codex/config.toml) ==")
     path = Path.home() / ".codex" / "config.toml"
@@ -247,6 +269,7 @@ def main() -> None:
     add(1, 1, "Remove boot startup", lambda: run_async(action_uninstall_startup))
     add(2, 1, "Install AutoHotkey", lambda: run_async(action_install_ahk))
     add(0, 2, "Check status", lambda: run_async(action_status))
+    add(2, 2, "Enable YOLO (no prompts)", lambda: run_async(action_enable_yolo))
 
     def do_all() -> None:
         def seq(_log):
@@ -254,6 +277,7 @@ def main() -> None:
             action_uv_sync(_log)
             action_register_claude(_log)
             action_register_codex(_log)
+            action_enable_yolo(_log)
             action_status(_log)
             _log("===== DONE. Restart Claude Code / Codex to load the server. =====\n")
         run_async(seq)

@@ -117,40 +117,81 @@ def _linux_env(display: Optional[int]):
 # Server + constants
 # --------------------------------------------------------------------------- #
 SERVER_INSTRUCTIONS = """\
-Low-level computer-use server: mouse, keyboard, shell, windows, processes,
-screenshots, cropping, screen recording, run-as-admin and boot-startup.
+LOW-LEVEL COMPUTER-USE SERVER — 53 tools for real, unsandboxed desktop control on
+Windows AND Linux. Every tool returns a JSON string: {"ok": true, ...} on success
+or {"ok": false, "error": "..."} on failure — ALWAYS read `ok`. A companion Skill
+named "lowlevel-computer-use" documents every feature in depth (SKILL.md +
+reference/TOOLS.md, WORKFLOWS.md, PLATFORMS.md) — consult it for exact parameters.
 
-BACKGROUND / UNFOCUSED CONTROL is first-class. mouse_click, type_text and
-screenshot all accept `hwnd` or `window_title`. When set, input is delivered to
-that exact window via Win32 messages WITHOUT focusing or foregrounding it, and
-screenshot uses PrintWindow so the window is captured even if occluded, minimized,
-or running on an off-screen headless desktop. Workflow:
-  1. list_windows to find the top-level window (title + handle).
-  2. list_child_windows to find the specific control (e.g. the Edit box) + its rect.
-  3. Drive it: mouse_click(hwnd=..., x, y) with CLIENT coords, type_text(hwnd=...),
-     win_set_control_text(hwnd=...) (most reliable for text), win_send_keys(hwnd=...).
-  4. screenshot(hwnd=...) to see the result without bringing the window forward.
-Headless GUI: create_headless_desktop -> launch_on_headless_desktop ->
-list_headless_windows -> drive + screenshot(hwnd=...) -> close_headless_desktop.
+GOLDEN RULES
+  1. Look before acting: screenshot (full or screenshot(hwnd=...)) to see state.
+  2. Resolve handles at run time (list_windows -> list_child_windows); NEVER
+     hard-code handles — they change every launch.
+  3. Prefer BACKGROUND targeting so you don't steal the user's focus.
+  4. Foreground mouse uses SCREEN pixels; background clicks use CLIENT coords of
+     the target window.
+  5. Verify after acting (re-screenshot). 6. Pair every create with a destroy/stop.
 
-MACROS AS SKILLS: when you perform a multi-step UI sequence that the user is
-likely to repeat (e.g. "open app X, click here, type this, save"), DO NOT leave it
-as ad-hoc tool calls. Capture it as a reusable macro by creating a Skill that
-records the ordered tool calls with their parameters, so it can be replayed later.
-Use the skill-creator skill (or write a SKILL.md) following the template in this
-repo's macros/MACRO_SKILL_TEMPLATE.md. A good macro skill: names the goal, lists
-the exact tool calls in order (with concrete hwnd/title resolution steps, not
-hard-coded handles, since handles change per launch), notes verification
-screenshots, and parameterizes the parts that vary (text to type, file to open).
-Prefer background-targeting tools in macros so replays don't steal focus.
+FULL TOOL CATALOG (names are the tools)
+- Mouse/keyboard (X-platform): get_screen_size, get_cursor_position, mouse_move,
+  mouse_click, mouse_drag, mouse_scroll, type_text, press_keys.
+- Shell: run_command (stdout/stderr/exit code, cwd, timeout).
+- Windows (X-platform): list_windows, get_active_window, move_window, resize_window,
+  window_action (focus/minimize/maximize/restore/close), show_window, hide_window.
+- Background/unfocused targeting: mouse_click/type_text/screenshot accept hwnd or
+  window_title; list_child_windows, win_set_control_text (most reliable text entry),
+  win_send_keys.
+- Processes: list_processes, kill_process (by pid or exact name; force option).
+- Screens/images: screenshot (monitor 0=all/1=primary..., region, or single-window
+  hwnd capture), crop_image.
+- Recording: start_screen_recording, stop_screen_recording, recording_status (mp4).
+- Headless-with-GUI (Windows off-screen desktop): create_headless_desktop,
+  launch_on_headless_desktop, list_headless_windows, close_headless_desktop,
+  show_headless_desktop / hide_headless_desktop (switch the live screen for a login).
+- Headless-with-GUI (Linux Xvfb): linux_status, create_virtual_display,
+  launch_on_virtual_display, list_virtual_display_windows, screenshot_virtual_display,
+  stop_virtual_display.
+- AutoHotkey (Windows): ahk_status, run_ahk, ahk_control_send.
+- Ephemeral WSL (Windows host): wsl_status, wsl_list_distros, wsl_create_temp,
+  wsl_run, wsl_list_temp, wsl_destroy, wsl_destroy_all_temp.
+- Run-as-admin & boot: is_admin, run_command_as_admin, install_startup,
+  uninstall_startup, startup_status.
 
-CROSS-PLATFORM: these tools work on Windows AND Linux. On Linux, window targeting,
-background input and per-window capture use X11 (xdotool/wmctrl/ImageMagick);
-`hwnd` is the X11 window id. The Linux 'headless with GUI' is an Xvfb virtual
-display (create_virtual_display -> launch_on_virtual_display -> drive with the
-`display` field on click/type/screenshot -> stop_virtual_display). On a Windows
-host you can also spin up a throwaway Linux box with wsl_create_temp / wsl_run /
-wsl_destroy to run Linux software on demand.
+BACKGROUND / UNFOCUSED CONTROL (first-class). Workflow:
+  1. list_windows -> find the top-level window (title + handle).
+  2. list_child_windows -> find the specific control (e.g. the Edit box) + rect.
+  3. Drive it WITHOUT focus: mouse_click(hwnd=, x, y) [CLIENT coords],
+     type_text(hwnd=), win_set_control_text(hwnd=) [most reliable], win_send_keys(hwnd=).
+  4. screenshot(hwnd=) to see the result without bringing the window forward.
+  Background input uses Win32 PostMessage/WM_CHAR (Windows) or XSendEvent (Linux);
+  some apps ignore synthetic events (raw input / physical-key checks / xterm with
+  allowSendEvents off) — then use win_set_control_text, AHK ahk_control_send, or
+  focus the window first.
+
+CROSS-PLATFORM. The same tools work on Windows and Linux. On Linux `hwnd` is an X11
+window id; window mgmt/background input/per-window capture use xdotool/wmctrl/
+ImageMagick. The Linux 'headless with GUI' is an Xvfb virtual display — pass the
+`display` field to click/type/screenshot/keys to route input there. On a Windows
+host you can spin up a throwaway Linux box with wsl_create_temp -> wsl_run ->
+wsl_destroy. Check availability with linux_status / ahk_status / wsl_status.
+
+SHOW-FOR-LOGIN. If automation hits a human-only login: show a normal window with
+show_window (hide_window after), or a whole Windows headless desktop with
+show_headless_desktop (hide_headless_desktop after).
+
+MACROS AS SKILLS. When you perform a multi-step UI sequence the user is likely to
+repeat ("open app X, click here, type this, save"), DO NOT leave it as ad-hoc tool
+calls — capture it as a reusable macro Skill that records the ordered tool calls.
+Use the skill-creator skill or write a SKILL.md following this repo's
+macros/MACRO_SKILL_TEMPLATE.md: name the goal, list the exact tool calls in order
+with run-time handle resolution (not hard-coded handles), note verification
+screenshots, and parameterize what varies. Prefer background tools so replays don't
+steal focus.
+
+SAFETY. run_command, run_command_as_admin, kill_process, run_ahk,
+window_action(close), wsl_destroy, and the launch/startup tools are destructive or
+system-modifying — confirm intent. These tools act directly on the host with the
+user's privileges.
 """
 
 mcp = FastMCP("computer_use_mcp", instructions=SERVER_INSTRUCTIONS)

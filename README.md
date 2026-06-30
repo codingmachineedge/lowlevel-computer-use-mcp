@@ -168,6 +168,42 @@ args = ["run", "--directory", "C:\\path\\to\\lowlevel-computer-use-mcp", "lowlev
 startup_timeout_sec = 60
 ```
 
+### YOLO mode (auto-approve, no permission prompts)
+
+The GUI installer enables this by default. To do it manually for Claude Code, add a
+wildcard allow rule for this server's tools to `~/.claude/settings.json`:
+
+```json
+{ "permissions": { "allow": ["mcp__lowlevel-computer-use__*"] } }
+```
+
+For Codex, set the global approval policy in `~/.codex/config.toml`:
+
+```toml
+approval_policy = "never"
+```
+
+> ⚠️ YOLO means every tool runs without asking — including destructive ones
+> (`kill_process`, `run_command`, `run_command_as_admin`, `wsl_destroy`). Only enable
+> it if you trust the agents driving this server.
+
+---
+
+## Agent skill — every feature documented
+
+A companion **skill** (`skills/lowlevel-computer-use/`) teaches agents the entire
+toolset: a top-level `SKILL.md` plus `reference/TOOLS.md` (exhaustive per-tool
+parameters), `reference/WORKFLOWS.md` (end-to-end recipes) and
+`reference/PLATFORMS.md` (Windows/Linux specifics & gotchas). Install it for Claude
+Code by copying it into your skills directory:
+
+```bash
+cp -r skills/lowlevel-computer-use ~/.claude/skills/
+```
+
+The MCP server also ships condensed instructions inline, so any MCP client gets a
+full feature overview on connect.
+
 ---
 
 ## Background / unfocused window targeting
