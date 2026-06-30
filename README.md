@@ -20,6 +20,7 @@ Codex, Claude Desktop, etc. — as a set of well-described tools:
 - 🐧 **Cross-platform** — the same tools work natively on **Linux** (X11 via xdotool/wmctrl), with **Xvfb** virtual displays for headless-with-GUI
 - 🌀 **Ephemeral WSL** — on a Windows host, spin up a throwaway Linux distro on demand, run commands, tear it down
 - 🧩 **GUI installer** — one window that installs everything automatically
+- 💸 **Cheap Version** — a no-MCP command-line fallback that runs any tool directly from CLI args, for when MCP connections keep failing
 
 > ⚠️ **This server performs real, unsandboxed actions on the host machine** —
 > clicking, typing, killing processes and running shell/elevated commands with your
@@ -186,6 +187,59 @@ approval_policy = "never"
 > ⚠️ YOLO means every tool runs without asking — including destructive ones
 > (`kill_process`, `run_command`, `run_command_as_admin`, `wsl_destroy`). Only enable
 > it if you trust the agents driving this server.
+
+---
+
+## Cheap Version (no-MCP fallback)
+
+If MCP connections keep failing, you don't need MCP at all. The **Cheap Version** is
+a command-line fallback that runs the **exact same tool functions** in-process and
+prints the JSON result — no client, transport, or server connection involved.
+
+List every available tool:
+
+```bash
+uv run lowlevel-computer-use-cheap --list
+```
+
+Take a screenshot:
+
+```bash
+uv run lowlevel-computer-use-cheap screenshot --monitor 1
+```
+
+Double-click at a point:
+
+```bash
+uv run lowlevel-computer-use-cheap mouse_click --x 960 --y 540 --clicks 2
+```
+
+Press a hotkey (values are parsed as JSON, so lists work):
+
+```bash
+uv run lowlevel-computer-use-cheap press_keys --keys '["ctrl","s"]'
+```
+
+Run a shell command:
+
+```bash
+uv run lowlevel-computer-use-cheap run_command --command "ipconfig /all"
+```
+
+Pass a whole argument object as JSON:
+
+```bash
+uv run lowlevel-computer-use-cheap screenshot --json '{"window_title":"Notepad"}'
+```
+
+The same thing is also available as a subcommand of the main entry point:
+
+```bash
+uv run lowlevel-computer-use-mcp cheap get_screen_size
+```
+
+Every parameter from the [Tool Reference](#tools) is accepted as `--<param> <value>`
+(or via `--json`). Output is the identical `{"ok": true, ...}` JSON the MCP tools return.
 
 ---
 

@@ -20,7 +20,9 @@ it in a context where that is acceptable.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import ctypes
+import inspect
 import json
 import os
 import platform
@@ -33,7 +35,7 @@ import time
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.fastmcp import FastMCP
@@ -2745,6 +2747,112 @@ async def startup_status() -> str:
 
 
 # =========================================================================== #
+# CHEAP VERSION — no-MCP command-line fallback
+# =========================================================================== #
+# When MCP connections keep failing, every tool can be invoked directly from the
+# command line. This "Cheap Version" runs the exact same tool function in-process
+# and prints its JSON result — no MCP client, transport, or server needed.
+#
+#   lowlevel-computer-use-cheap <tool> [--key value ...] [--json '{...}']
+#   lowlevel-computer-use-mcp cheap <tool> [--key value ...]
+#
+# Examples:
+#   lowlevel-computer-use-cheap get_screen_size
+#   lowlevel-computer-use-cheap screenshot --monitor 1
+#   lowlevel-computer-use-cheap mouse_click --x 960 --y 540 --clicks 2
+#   lowlevel-computer-use-cheap press_keys --keys '["ctrl","s"]'
+#   lowlevel-computer-use-cheap run_command --command "ipconfig /all"
+#   lowlevel-computer-use-cheap --list
+
+def _cheap_tool_names() -> list[str]:
+    names = []
+    for name, obj in globals().items():
+        if name.startswith("_") or name in ("main", "cheap_entry"):
+            continue
+        if inspect.iscoroutinefunction(obj):
+            names.append(name)
+    return sorted(names)
+
+
+def _cheap_usage() -> str:
+    lines = [
+        "Cheap Version — run any tool directly, without MCP.",
+        "",
+        "Usage:",
+        "  lowlevel-computer-use-cheap <tool> [--key value ...] [--json '{...}']",
+        "  lowlevel-computer-use-mcp cheap <tool> [--key value ...]",
+        "",
+        "Values are parsed as JSON when possible (so --keys '[\"ctrl\",\"c\"]' and",
+        "--x 100 work); otherwise treated as a string. A bare --flag means true.",
+        "",
+        "Tools:",
+    ]
+    for t in _cheap_tool_names():
+        lines.append("  " + t)
+    return "\n".join(lines)
+
+
+def _cheap_parse_args(rest: list[str]) -> dict[str, Any]:
+    data: dict[str, Any] = {}
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--json":
+            data.update(json.loads(rest[i + 1]))
+            i += 2
+            continue
+        if tok.startswith("--"):
+            key = tok[2:]
+            if i + 1 < len(rest) and not rest[i + 1].startswith("--"):
+                raw = rest[i + 1]
+                try:
+                    val: Any = json.loads(raw)
+                except (ValueError, json.JSONDecodeError):
+                    val = raw
+                data[key] = val
+                i += 2
+            else:
+                data[key] = True
+                i += 1
+        else:
+            i += 1
+    return data
+
+
+def _cheap_main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "--list", "list", "help"):
+        print(_cheap_usage())
+        return 0
+    name = argv[0]
+    func = globals().get(name)
+    if not inspect.iscoroutinefunction(func):
+        print(json.dumps({"ok": False, "error": f"Unknown tool '{name}'. Run with --list."}, indent=2))
+        return 1
+    try:
+        data = _cheap_parse_args(argv[1:])
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": f"Could not parse arguments: {exc}"}, indent=2))
+        return 1
+    try:
+        sig = inspect.signature(func)
+        if "params" in sig.parameters:
+            model_cls = get_type_hints(func).get("params")
+            result = asyncio.run(func(model_cls(**data)))
+        else:
+            result = asyncio.run(func())
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, indent=2))
+        return 1
+    print(result)
+    return 0
+
+
+def cheap_entry() -> None:
+    """Console-script entry point for the Cheap Version CLI."""
+    sys.exit(_cheap_main(sys.argv[1:]))
+
+
+# =========================================================================== #
 # Entry point
 # =========================================================================== #
 def _serve(http: bool, host: str, port: int) -> None:
@@ -2763,9 +2871,14 @@ def main() -> None:
     Subcommands manage the boot-startup scheduled task. Flags switch transport
     and elevation.
     """
+    # Cheap Version fallback: `... cheap <tool> [args]` runs a tool without MCP.
+    if len(sys.argv) > 1 and sys.argv[1] == "cheap":
+        sys.exit(_cheap_main(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(
         prog="lowlevel-computer-use-mcp",
-        description="Low-level computer-use MCP server.",
+        description="Low-level computer-use MCP server. Subcommand `cheap` runs a tool "
+        "directly from the command line without MCP (fallback when connections fail).",
     )
     parser.add_argument("--http", action="store_true", help="Serve over streamable HTTP instead of stdio")
     parser.add_argument("--host", default=DEFAULT_HTTP_HOST, help="Host for --http mode")
