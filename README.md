@@ -34,8 +34,8 @@ Codex, Claude Desktop, etc. — as a set of well-described tools:
 |------|-------------|
 | `get_screen_size` | Primary screen resolution |
 | `get_cursor_position` | Current mouse position |
-| `mouse_move` | Move cursor to `(x, y)` |
-| `mouse_click` | Click; **`hwnd`/`window_title` → background click (client coords)** |
+| `mouse_move` | Smoothly move cursor to `(x, y)` |
+| `mouse_click` | Smoothly move then click; **`hwnd`/`window_title` → background click (client coords)** |
 | `mouse_drag` | Press-drag-release between two points |
 | `mouse_scroll` | Scroll the wheel up/down |
 | `type_text` | Type text; **`hwnd`/`window_title` → background WM_CHAR** |

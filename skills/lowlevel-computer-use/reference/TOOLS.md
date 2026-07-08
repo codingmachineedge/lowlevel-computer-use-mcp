@@ -16,8 +16,9 @@ No params. → `{ok, x, y}` — current cursor position (screen pixels).
 
 ### `mouse_move` (X)
 - `*x` int ≥0, `*y` int ≥0 — target screen coordinate.
-- `duration` float 0–10 (default 0) — seconds to animate.
-→ `{ok, x, y}`.
+- `duration` float 0–10 (default 0) — seconds to animate; `0` uses the visible smooth default.
+- `instant` bool (default false) — set true only when you intentionally want a jump.
+→ `{ok, x, y, duration}`.
 
 ### `mouse_click` (X)
 - `x`, `y` int — click location (screen px in foreground mode; **omit to click at
@@ -25,6 +26,8 @@ No params. → `{ok, x, y}` — current cursor position (screen pixels).
 - `button` `"left"|"right"|"middle"` (default left).
 - `clicks` int 1–5 (default 1; 2 = double-click).
 - `interval` float (default 0) — seconds between clicks.
+- `move_duration` float 0–10 (default 0) — foreground only; `0` uses the visible smooth default before clicking.
+- `instant_move` bool (default false) — foreground only; jump to `x`/`y` before clicking.
 - `hwnd` int — **BACKGROUND TARGET**: post the click to this window without focusing it.
 - `window_title` str — background target by title substring (if `hwnd` omitted).
 - `display` int — *Linux only*: X display number of the target (e.g. Xvfb 99).
@@ -40,6 +43,8 @@ Background click requires explicit `x`/`y`.
 ### `mouse_scroll` (X)
 - `*amount` int — positive = up, negative = down (wheel clicks).
 - `x`, `y` int — move here before scrolling.
+- `move_duration` float 0–10 (default 0) — `0` uses the visible smooth default.
+- `instant_move` bool (default false) — jump to `x`/`y` before scrolling.
 → `{ok, scrolled}`.
 
 ### `type_text` (X)

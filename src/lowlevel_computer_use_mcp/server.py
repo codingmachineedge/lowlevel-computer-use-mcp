@@ -24,6 +24,7 @@ import asyncio
 import ctypes
 import inspect
 import json
+import math
 import os
 import platform
 import shutil
@@ -106,6 +107,9 @@ except Exception:  # pragma: no cover
 
 IS_WINDOWS = os.name == "nt"
 IS_LINUX = sys.platform.startswith("linux")
+_DEFAULT_MOUSE_MOVE_DURATION = max(0.0, min(float(os.environ.get("LOWLEVEL_MOUSE_MOVE_DURATION", "0.25")), 10.0))
+_MOUSE_MOVE_HZ = max(15, min(int(os.environ.get("LOWLEVEL_MOUSE_MOVE_HZ", "90")), 240))
+_MOUSE_MOVE_STEP_PX = max(4, min(int(os.environ.get("LOWLEVEL_MOUSE_MOVE_STEP_PX", "22")), 120))
 
 
 def _linux_env(display: Optional[int]):
@@ -113,6 +117,59 @@ def _linux_env(display: Optional[int]):
     if display is None:
         return None
     return {**os.environ, "DISPLAY": f":{display}"}
+
+
+def _smooth_duration(requested: Optional[float], instant: bool = False) -> float:
+    """Resolve requested movement duration.
+
+    A zero/omitted value means "use the visible default" so normal agent calls move
+    like a real pointer. Set the explicit instant flag when a jump is desired.
+    """
+    if instant:
+        return 0.0
+    if requested is not None and requested > 0:
+        return min(float(requested), 10.0)
+    return _DEFAULT_MOUSE_MOVE_DURATION
+
+
+def _smooth_mouse_move_to(x: int, y: int, *, duration: Optional[float] = None, instant: bool = False) -> None:
+    """Move the OS cursor in visible steps instead of relying on backend tweening.
+
+    PyAutoGUI can collapse short moves into a single SetCursorPos jump. This helper
+    sends a bounded series of small absolute moves with smoothstep easing so the
+    cursor visibly travels while remaining fast enough for automation.
+    """
+    if pyautogui is None:
+        return
+    target_x, target_y = int(x), int(y)
+    pos = pyautogui.position()
+    start_x, start_y = int(pos.x), int(pos.y)
+    distance = math.hypot(target_x - start_x, target_y - start_y)
+    resolved_duration = _smooth_duration(duration, instant)
+    if resolved_duration <= 0 or distance < 1:
+        pyautogui.moveTo(target_x, target_y, duration=0)
+        return
+
+    steps_by_time = max(2, int(math.ceil(resolved_duration * _MOUSE_MOVE_HZ)))
+    steps_by_distance = max(2, int(math.ceil(distance / _MOUSE_MOVE_STEP_PX)))
+    steps = min(360, max(steps_by_time, steps_by_distance))
+    started = time.perf_counter()
+    last_xy: tuple[int, int] | None = None
+
+    for i in range(1, steps + 1):
+        t = i / steps
+        eased = t * t * (3 - 2 * t)
+        nx = int(round(start_x + (target_x - start_x) * eased))
+        ny = int(round(start_y + (target_y - start_y) * eased))
+        if (nx, ny) != last_xy:
+            pyautogui.moveTo(nx, ny, duration=0)
+            last_xy = (nx, ny)
+        wake_at = started + resolved_duration * t
+        delay = wake_at - time.perf_counter()
+        if delay > 0:
+            time.sleep(delay)
+
+    pyautogui.moveTo(target_x, target_y, duration=0)
 
 
 # --------------------------------------------------------------------------- #
@@ -457,7 +514,14 @@ class MoveInput(BaseModel):
     x: int = Field(..., description="Target X coordinate in screen pixels", ge=0)
     y: int = Field(..., description="Target Y coordinate in screen pixels", ge=0)
     duration: float = Field(
-        default=0.0, description="Seconds to animate the move over (0 = instant)", ge=0, le=10
+        default=0.0,
+        description="Seconds to animate the move over. 0 uses the visible default duration.",
+        ge=0,
+        le=10,
+    )
+    instant: bool = Field(
+        default=False,
+        description="Set true only when you intentionally want the cursor to jump instantly.",
     )
 
 
@@ -482,9 +546,9 @@ async def mouse_move(params: MoveInput) -> str:
     """
     if (e := _require(pyautogui, "pyautogui")):
         return e
-    pyautogui.moveTo(params.x, params.y, duration=params.duration)
+    _smooth_mouse_move_to(params.x, params.y, duration=params.duration, instant=params.instant)
     pos = pyautogui.position()
-    return _ok(x=int(pos.x), y=int(pos.y))
+    return _ok(x=int(pos.x), y=int(pos.y), duration=_smooth_duration(params.duration, params.instant))
 
 
 class ClickInput(BaseModel):
@@ -499,6 +563,16 @@ class ClickInput(BaseModel):
     clicks: int = Field(default=1, description="Number of clicks (2 = double-click)", ge=1, le=5)
     interval: float = Field(
         default=0.0, description="Seconds between successive clicks", ge=0, le=5
+    )
+    move_duration: float = Field(
+        default=0.0,
+        description="Foreground only: seconds to visibly move before clicking. 0 uses the smooth default.",
+        ge=0,
+        le=10,
+    )
+    instant_move: bool = Field(
+        default=False,
+        description="Foreground only: jump to x/y before clicking instead of visibly moving.",
     )
     hwnd: Optional[int] = Field(
         default=None,
@@ -578,8 +652,9 @@ async def mouse_click(params: ClickInput) -> str:
         "interval": params.interval,
     }
     if params.x is not None and params.y is not None:
-        kwargs["x"] = params.x
-        kwargs["y"] = params.y
+        _smooth_mouse_move_to(
+            params.x, params.y, duration=params.move_duration, instant=params.instant_move
+        )
     pyautogui.click(**kwargs)
     pos = pyautogui.position()
     return _ok(
@@ -622,8 +697,13 @@ async def mouse_drag(params: DragInput) -> str:
     if (e := _require(pyautogui, "pyautogui")):
         return e
     if params.start_x is not None and params.start_y is not None:
-        pyautogui.moveTo(params.start_x, params.start_y)
-    pyautogui.dragTo(params.end_x, params.end_y, button=params.button.value, duration=params.duration)
+        _smooth_mouse_move_to(params.start_x, params.start_y)
+    pyautogui.dragTo(
+        params.end_x,
+        params.end_y,
+        button=params.button.value,
+        duration=_smooth_duration(params.duration),
+    )
     return _ok(end_x=params.end_x, end_y=params.end_y, button=params.button.value)
 
 
@@ -632,6 +712,13 @@ class ScrollInput(BaseModel):
     amount: int = Field(..., description="Scroll clicks; positive = up, negative = down")
     x: Optional[int] = Field(default=None, description="X to move to before scrolling", ge=0)
     y: Optional[int] = Field(default=None, description="Y to move to before scrolling", ge=0)
+    move_duration: float = Field(
+        default=0.0,
+        description="Seconds to visibly move before scrolling. 0 uses the smooth default.",
+        ge=0,
+        le=10,
+    )
+    instant_move: bool = Field(default=False, description="Jump to x/y before scrolling.")
 
 
 @mcp.tool(
@@ -656,7 +743,7 @@ async def mouse_scroll(params: ScrollInput) -> str:
     if (e := _require(pyautogui, "pyautogui")):
         return e
     if params.x is not None and params.y is not None:
-        pyautogui.moveTo(params.x, params.y)
+        _smooth_mouse_move_to(params.x, params.y, duration=params.move_duration, instant=params.instant_move)
     pyautogui.scroll(params.amount)
     return _ok(scrolled=params.amount)
 
