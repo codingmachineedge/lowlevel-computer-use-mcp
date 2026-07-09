@@ -26,6 +26,7 @@ Caveats (inherent to message-based injection, documented for honesty):
 from __future__ import annotations
 
 import ctypes
+import threading
 from ctypes import wintypes
 from typing import Any, Callable, Optional
 
@@ -152,7 +153,9 @@ def find_top_window(title: Optional[str], handle: Optional[int]) -> int:
     """Resolve a top-level window handle by exact handle or title substring."""
     if handle is not None:
         if not user32.IsWindow(handle):
-            raise WinIOError(f"No window with handle {handle}.")
+            # Not on this thread's desktop — accept it if ANY desktop owns it
+            # (headless-desktop windows); raises WinIOError otherwise.
+            return run_on_window_desktop(int(handle), lambda: int(handle))
         return int(handle)
     if not title:
         raise WinIOError("Provide a window title or handle.")
@@ -173,7 +176,14 @@ def find_top_window(title: Optional[str], handle: Optional[int]) -> int:
 
 
 def list_child_windows(hwnd: int) -> list[dict[str, Any]]:
-    """Enumerate child controls of a window with class, text and client rect."""
+    """Enumerate child controls of a window with class, text and client rect.
+
+    Works for windows on headless desktops too (cross-desktop dispatch).
+    """
+    return run_on_window_desktop(int(hwnd), lambda: _list_child_windows_impl(hwnd))
+
+
+def _list_child_windows_impl(hwnd: int) -> list[dict[str, Any]]:
     children: list[dict[str, Any]] = []
     top_rect = wintypes.RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(top_rect))
@@ -248,6 +258,90 @@ def _deepest_child_at(top: int, x: int, y: int) -> tuple[int, int, int]:
 
 
 # --------------------------------------------------------------------------- #
+# Cross-desktop dispatch
+#
+# USER hwnd operations (IsWindow, GetWindowRect, PostMessage, PrintWindow, ...)
+# only resolve windows on the *calling thread's* desktop. Windows launched on a
+# headless desktop (create_desktop / launch_on_desktop) are therefore invisible
+# to a caller attached to the default desktop, even though the hwnd itself is
+# session-valid. run_on_window_desktop() fixes that transparently: if the hwnd
+# does not resolve on the current desktop, it retries the operation on a fresh
+# worker thread attached (SetThreadDesktop) to each desktop of this window
+# station until one owns the hwnd. Fresh threads are required because
+# SetThreadDesktop fails on threads that already own windows/hooks.
+# --------------------------------------------------------------------------- #
+user32.GetProcessWindowStation.restype = wintypes.HANDLE
+DESKTOPENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.LPWSTR, LPARAM)
+user32.EnumDesktopsW.argtypes = [wintypes.HANDLE, DESKTOPENUMPROC, LPARAM]
+user32.SetThreadDesktop.argtypes = [HDESK]
+user32.SetThreadDesktop.restype = wintypes.BOOL
+
+# Desktop handles opened for cross-desktop dispatch. Kept for the process
+# lifetime on purpose: a desktop handle must outlive any thread attached to it,
+# and the handles are tiny (the CLI is one-shot; the server benefits from reuse).
+_XDESK_CACHE: dict[str, int] = {}
+
+
+def _enum_desktop_names() -> list[str]:
+    """Names of all desktops in this process's window station."""
+    names: list[str] = []
+
+    @DESKTOPENUMPROC
+    def cb(name, _lparam):
+        if name:
+            names.append(str(name))
+        return True
+
+    user32.EnumDesktopsW(user32.GetProcessWindowStation(), cb, 0)
+    return names
+
+
+def run_on_window_desktop(hwnd: int, fn: Callable[[], Any]) -> Any:
+    """Run fn() attached to whichever desktop owns `hwnd`.
+
+    Fast path: the hwnd resolves on the current thread's desktop -> call fn()
+    inline. Slow path: try each desktop in the window station on a dedicated
+    worker thread; the first desktop where IsWindow(hwnd) succeeds runs fn()
+    there (its result / exception is propagated). Raises WinIOError when the
+    hwnd resolves on no desktop at all.
+    """
+    if user32.IsWindow(hwnd):
+        return fn()
+
+    for name in _enum_desktop_names():
+        outcome: dict[str, Any] = {}
+
+        def worker(desk_name=name):
+            hd = _XDESK_CACHE.get(desk_name)
+            if not hd:
+                hd = user32.OpenDesktopW(desk_name, 0, False, GENERIC_ALL)
+                if not hd:
+                    return
+                _XDESK_CACHE[desk_name] = int(hd)
+            if not user32.SetThreadDesktop(hd):
+                return
+            if not user32.IsWindow(hwnd):
+                return
+            outcome["found"] = True
+            try:
+                outcome["result"] = fn()
+            except BaseException as exc:  # propagate to the caller thread
+                outcome["error"] = exc
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        t.join(timeout=60)
+        if outcome.get("found"):
+            if "error" in outcome:
+                raise outcome["error"]
+            return outcome.get("result")
+
+    raise WinIOError(
+        f"No window with handle {hwnd} on any desktop of this window station."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Background mouse / keyboard
 # --------------------------------------------------------------------------- #
 def _lparam_xy(x: int, y: int) -> int:
@@ -265,8 +359,12 @@ def send_click(top: int, x: int, y: int, button: str = "left", double: bool = Fa
     """Post a mouse click to the deepest control at client point (x, y) of `top`.
 
     x, y are in client coordinates of the top-level window. The window does not
-    need to be focused or visible.
+    need to be focused or visible — headless-desktop windows work too.
     """
+    return run_on_window_desktop(int(top), lambda: _send_click_impl(top, x, y, button, double))
+
+
+def _send_click_impl(top: int, x: int, y: int, button: str, double: bool) -> dict[str, Any]:
     down, up, dbl, mk = _BTN[button]
     target, cx, cy = _deepest_child_at(top, x, y)
     lp = _lparam_xy(cx, cy)
@@ -281,18 +379,24 @@ def send_click(top: int, x: int, y: int, button: str = "left", double: bool = Fa
 
 def send_text(hwnd: int, text: str) -> dict[str, Any]:
     """Post each character as WM_CHAR to a window (typically a focused control)."""
-    for ch in text:
-        user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
-    return {"target_hwnd": int(hwnd), "chars": len(text)}
+    def _impl() -> dict[str, Any]:
+        for ch in text:
+            user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0)
+        return {"target_hwnd": int(hwnd), "chars": len(text)}
+
+    return run_on_window_desktop(int(hwnd), _impl)
 
 
 def set_control_text(hwnd: int, text: str) -> dict[str, Any]:
     """Set a control's text directly via WM_SETTEXT (reliable for edit controls)."""
-    buf = ctypes.create_unicode_buffer(text)
-    res = user32.SendMessageTimeoutW(
-        hwnd, WM_SETTEXT, 0, ctypes.addressof(buf), 0, 2000, ctypes.byref(ctypes.c_size_t())
-    )
-    return {"target_hwnd": int(hwnd), "ok": bool(res), "text_len": len(text)}
+    def _impl() -> dict[str, Any]:
+        buf = ctypes.create_unicode_buffer(text)
+        res = user32.SendMessageTimeoutW(
+            hwnd, WM_SETTEXT, 0, ctypes.addressof(buf), 0, 2000, ctypes.byref(ctypes.c_size_t())
+        )
+        return {"target_hwnd": int(hwnd), "ok": bool(res), "text_len": len(text)}
+
+    return run_on_window_desktop(int(hwnd), _impl)
 
 
 _VK = {
@@ -333,14 +437,17 @@ def send_keys(hwnd: int, keys: list[str]) -> dict[str, Any]:
     are unreliable for apps that check physical key state - prefer set_control_text
     for text entry.
     """
-    vks = [_vk_for(k) for k in keys]
-    for vk in vks:
-        down, _ = _key_lparams(vk)
-        user32.PostMessageW(hwnd, WM_KEYDOWN, vk, down)
-    for vk in reversed(vks):
-        _, up = _key_lparams(vk)
-        user32.PostMessageW(hwnd, WM_KEYUP, vk, up)
-    return {"target_hwnd": int(hwnd), "keys": keys}
+    def _impl() -> dict[str, Any]:
+        vks = [_vk_for(k) for k in keys]
+        for vk in vks:
+            down, _ = _key_lparams(vk)
+            user32.PostMessageW(hwnd, WM_KEYDOWN, vk, down)
+        for vk in reversed(vks):
+            _, up = _key_lparams(vk)
+            user32.PostMessageW(hwnd, WM_KEYUP, vk, up)
+        return {"target_hwnd": int(hwnd), "keys": keys}
+
+    return run_on_window_desktop(int(hwnd), _impl)
 
 
 # --------------------------------------------------------------------------- #
@@ -369,8 +476,13 @@ class BITMAPINFO(ctypes.Structure):
 def capture_window(hwnd: int, client_only: bool = False):
     """Capture a window via PrintWindow into a PIL Image, even if unfocused/occluded.
 
-    Returns (PIL.Image, rendered_ok: bool). Requires Pillow.
+    Returns (PIL.Image, rendered_ok: bool). Requires Pillow. Windows living on a
+    headless desktop are captured via cross-desktop dispatch.
     """
+    return run_on_window_desktop(int(hwnd), lambda: _capture_window_impl(hwnd, client_only))
+
+
+def _capture_window_impl(hwnd: int, client_only: bool = False):
     from PIL import Image  # local import keeps the dependency optional
 
     if not user32.IsWindow(hwnd):
