@@ -1,5 +1,9 @@
 # Repository agent instructions
 
+## Desktop automation preference
+
+- Prefer a headless desktop for GUI automation whenever the task and application support it. Use the visible interactive desktop only when headless operation is unavailable or human-visible interaction is required, and return to headless operation afterward when practical.
+
 ## Shared repository completion memory
 
 - Every task that changes this repository must end with all intended task work committed and pushed.
