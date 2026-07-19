@@ -340,10 +340,15 @@ Some steps (sign-in) need a human. Temporarily switch the live screen to the
 off-screen desktop:
 
 ```jsonc
-show_headless_desktop { "name": "work" }
+show_headless_desktop {
+  "name": "work",
+  "instruction": "Sign in to the app, then tell the agent you are done."
+}
 ```
 
-…let the user log in, then switch back to the normal desktop:
+The interactive desktop has a topmost banner that cannot be closed. It displays
+the instruction and includes an **EMERGENCY EXIT** button that immediately returns
+the user to the normal desktop. After the user finishes, switch back normally:
 
 ```jsonc
 hide_headless_desktop { "name": "work" }

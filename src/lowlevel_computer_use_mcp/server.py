@@ -1887,6 +1887,15 @@ class HeadlessDesktopInput(BaseModel):
     )
 
 
+class ShowHeadlessDesktopInput(HeadlessDesktopInput):
+    instruction: str = Field(
+        default="Complete the requested manual step.",
+        description="Short instruction displayed in the non-dismissible top safety banner",
+        min_length=1,
+        max_length=240,
+    )
+
+
 @mcp.tool(
     name="create_headless_desktop",
     annotations={
@@ -2112,23 +2121,26 @@ async def hide_window(params: HideWindowInput) -> str:
         "openWorldHint": True,
     },
 )
-async def show_headless_desktop(params: HeadlessDesktopInput) -> str:
+async def show_headless_desktop(params: ShowHeadlessDesktopInput) -> str:
     """Temporarily switch the live screen to a headless desktop for human interaction.
 
     The entire off-screen desktop (and the apps running on it) becomes interactive
-    and visible, so a person can complete a LOGIN or any manual step. Call
-    `hide_headless_desktop` to switch back to the normal desktop afterwards.
+    and visible, so a person can complete a LOGIN or any manual step. A topmost,
+    non-dismissible banner explains what to do and provides an EMERGENCY EXIT button
+    that immediately restores the normal desktop. Call `hide_headless_desktop` to
+    switch back normally afterwards.
 
     Args:
-        params (HeadlessDesktopInput): the off-screen desktop name.
+        params (ShowHeadlessDesktopInput): desktop name and banner instruction.
 
     Returns:
-        str: JSON {"ok": true, "name": "...", "visible": true, "note": "..."}.
+        str: JSON {"ok": true, "name": "...", "visible": true,
+        "safety_banner": true, "note": "..."}.
     """
     if (e := _require(winio, "winio (Windows)")):
         return e
     try:
-        return _ok(**winio.show_desktop(params.name))
+        return _ok(**winio.show_desktop(params.name, params.instruction))
     except winio.WinIOError as exc:
         return _err(str(exc))
 

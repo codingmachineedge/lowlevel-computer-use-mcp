@@ -3,6 +3,7 @@
 ## Desktop automation preference
 
 - Prefer a headless desktop for GUI automation whenever the task and application support it. Use the visible interactive desktop only when headless operation is unavailable or human-visible interaction is required, and return to headless operation afterward when practical.
+- When switching a headless desktop into interactive view, always provide a short, concrete `instruction` for the non-dismissible safety banner. Never obscure or disable its **EMERGENCY EXIT** button.
 
 ## Shared repository completion memory
 
